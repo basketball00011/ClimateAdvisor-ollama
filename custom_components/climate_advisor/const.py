@@ -1708,6 +1708,9 @@ ATTR_FORECAST_BIAS_CONFIDENCE = "forecast_bias_confidence"
 # Config keys
 CONF_AI_ENABLED = "ai_enabled"
 CONF_AI_API_KEY = "ai_api_key"
+# Optional Anthropic-compatible endpoint (e.g. a local Ollama server at
+# http://localhost:11434, or a LiteLLM/claude proxy). Empty = api.anthropic.com.
+CONF_AI_BASE_URL = "ai_base_url"
 CONF_AI_MODEL = "ai_model"
 CONF_AI_REASONING_EFFORT = "ai_reasoning_effort"
 CONF_AI_MAX_TOKENS = "ai_max_tokens"
@@ -1723,6 +1726,10 @@ CONF_AI_INVESTIGATOR_RPD = "ai_investigator_requests_per_day"
 
 # Defaults
 DEFAULT_AI_ENABLED = False
+DEFAULT_AI_BASE_URL = ""
+# Placeholder key sent to custom endpoints that do not validate it (Ollama ignores it,
+# but the SDK refuses to build a client without one).
+AI_LOCAL_PLACEHOLDER_API_KEY = "ollama"
 DEFAULT_AI_MODEL = "claude-sonnet-5"
 DEFAULT_AI_REASONING_EFFORT = "low"
 DEFAULT_AI_MAX_TOKENS = 4096

@@ -108,6 +108,7 @@ from .const import (
     COMFORT_STALL_REMINDER_SECONDS,
     COMFORT_STALL_SUSTAIN_SECONDS,
     CONF_AI_API_KEY,
+    CONF_AI_BASE_URL,
     CONF_AI_ENABLED,
     CONF_AUTOMATION_GRACE_PERIOD,
     CONF_BRIEFING_NOTIFICATIONS_ENABLED,
@@ -835,7 +836,7 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
         self.ai_skills: AISkillRegistry | None = None
         self._investigation_report_history: list[dict] = []
         self._ai_client_config: dict[str, Any] | None = None
-        if config.get(CONF_AI_ENABLED) and config.get(CONF_AI_API_KEY):
+        if config.get(CONF_AI_ENABLED) and (config.get(CONF_AI_API_KEY) or config.get(CONF_AI_BASE_URL)):
             from .ai_skills import AISkillRegistry as _AISkillRegistry
             from .ai_skills_investigator import register_investigator_skill
 
@@ -850,9 +851,10 @@ class ClimateAdvisorCoordinator(DataUpdateCoordinator):
             _LOGGER.debug("AI subsystem registered — client build deferred to async_restore_state()")
         else:
             _LOGGER.debug(
-                "AI subsystem disabled — enabled: %s, key present: %s",
+                "AI subsystem disabled — enabled: %s, key present: %s, endpoint set: %s",
                 config.get(CONF_AI_ENABLED, False),
                 bool(config.get(CONF_AI_API_KEY)),
+                bool(config.get(CONF_AI_BASE_URL)),
             )
 
         # Startup safety — first update checks HVAC state before applying classification

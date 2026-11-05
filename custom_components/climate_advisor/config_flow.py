@@ -22,6 +22,7 @@ from .const import (
     AI_REASONING_OPTIONS,
     CONF_AI_API_KEY,
     CONF_AI_AUTO_REQUESTS_PER_DAY,
+    CONF_AI_BASE_URL,
     CONF_AI_ENABLED,
     CONF_AI_INVESTIGATOR_ENABLED,
     CONF_AI_INVESTIGATOR_RPD,
@@ -72,6 +73,7 @@ from .const import (
     CONF_VACATION_TOGGLE_INVERT,
     CONF_WELCOME_HOME_DEBOUNCE,
     DEFAULT_AI_AUTO_REQUESTS_PER_DAY,
+    DEFAULT_AI_BASE_URL,
     DEFAULT_AI_ENABLED,
     DEFAULT_AI_INVESTIGATOR_ENABLED,
     DEFAULT_AI_INVESTIGATOR_RPD,
@@ -1913,9 +1915,15 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
             ai_enabled = user_input.get(CONF_AI_ENABLED, DEFAULT_AI_ENABLED)
             new_key = user_input.get(CONF_AI_API_KEY, "")
             existing_key = current.get(CONF_AI_API_KEY, "")
+            from .claude_api import normalize_base_url  # noqa: PLC0415
 
-            # If AI enabled but no key provided and no existing key, require one
-            if ai_enabled and not new_key and not existing_key:
+            new_base_url = normalize_base_url(user_input.get(CONF_AI_BASE_URL, ""))
+            existing_base_url = normalize_base_url(current.get(CONF_AI_BASE_URL, ""))
+            user_input[CONF_AI_BASE_URL] = new_base_url
+
+            # A key is required for api.anthropic.com; a custom endpoint (e.g. local
+            # Ollama) works without one.
+            if ai_enabled and not new_key and not existing_key and not new_base_url:
                 errors[CONF_AI_API_KEY] = "ai_key_required"
 
             # Validate temperature range
@@ -1931,11 +1939,16 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
             if not (256 <= ai_max_tokens <= 16384):
                 errors[CONF_AI_MAX_TOKENS] = "ai_max_tokens_out_of_range"
 
-            if not errors and new_key and new_key != existing_key and ai_enabled:
+            endpoint_changed = new_base_url != existing_base_url
+            model_changed = new_base_url and user_input.get(CONF_AI_MODEL) != current.get(CONF_AI_MODEL)
+            key_changed = bool(new_key) and new_key != existing_key
+            if not errors and ai_enabled and (key_changed or endpoint_changed or model_changed):
                 try:
                     from .claude_api import ClaudeAPIClient
 
                     test_config = {**current, **user_input}
+                    if not new_key:
+                        test_config[CONF_AI_API_KEY] = existing_key
                     # ClaudeAPIClient's constructor does blocking I/O (AsyncAnthropic
                     # reads a local config file and loads the TLS cert bundle) —
                     # offload it instead of running that inline in this async step.
@@ -1984,10 +1997,17 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
         # slow network either, hence the wrapping timeout here.
         from .claude_api import fetch_available_models  # noqa: PLC0415
 
+        existing_base_url = current.get(CONF_AI_BASE_URL, "") or ""
         try:
-            model_options = await asyncio.wait_for(fetch_available_models(existing_key, hass=self.hass), timeout=5.0)
+            model_options = await asyncio.wait_for(
+                fetch_available_models(existing_key, hass=self.hass, base_url=existing_base_url), timeout=5.0
+            )
         except Exception:  # noqa: BLE001 — includes asyncio.TimeoutError; must never block config flow render
-            model_options = AI_MODELS
+            model_options = [] if existing_base_url else AI_MODELS
+        # Keep the current model selectable even if the endpoint didn't list it.
+        current_model = current.get(CONF_AI_MODEL, DEFAULT_AI_MODEL)
+        if current_model and current_model not in model_options:
+            model_options = [current_model, *model_options]
 
         schema = vol.Schema(
             {
@@ -1995,6 +2015,10 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
                     CONF_AI_ENABLED,
                     default=current.get(CONF_AI_ENABLED, DEFAULT_AI_ENABLED),
                 ): selector.BooleanSelector(),
+                vol.Optional(
+                    CONF_AI_BASE_URL,
+                    default=current.get(CONF_AI_BASE_URL, DEFAULT_AI_BASE_URL),
+                ): selector.TextSelector(selector.TextSelectorConfig(type=selector.TextSelectorType.URL)),
                 vol.Optional(CONF_AI_API_KEY, default=""): selector.TextSelector(
                     selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
                 ),
@@ -2005,6 +2029,7 @@ class ClimateAdvisorOptionsFlow(config_entries.OptionsFlow):
                     selector.SelectSelectorConfig(
                         options=[{"value": m, "label": m} for m in model_options],
                         mode=selector.SelectSelectorMode.DROPDOWN,
+                        custom_value=True,  # allow typing a local model name, e.g. "qwen3:14b"
                     )
                 ),
                 vol.Optional(

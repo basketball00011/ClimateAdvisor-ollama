@@ -16,6 +16,7 @@ from typing import Any
 from .const import (
     AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
     AI_CIRCUIT_BREAKER_THRESHOLD,
+    AI_LOCAL_PLACEHOLDER_API_KEY,
     AI_MAX_RETRIES,
     AI_MODEL_CAPABILITIES,
     AI_MODEL_CAPABILITIES_DEFAULT,
@@ -27,6 +28,7 @@ from .const import (
     AI_THINKING_SHAPE_ADAPTIVE,
     CONF_AI_API_KEY,
     CONF_AI_AUTO_REQUESTS_PER_DAY,
+    CONF_AI_BASE_URL,
     CONF_AI_INVESTIGATOR_ENABLED,
     CONF_AI_INVESTIGATOR_RPD,
     CONF_AI_MANUAL_REQUESTS_PER_DAY,
@@ -142,6 +144,39 @@ class _BudgetTracker:
     budget_month: int = field(default_factory=lambda: date.today().month)
 
 
+def normalize_base_url(base_url: str | None) -> str:
+    """Trim whitespace/trailing slashes and a trailing "/v1" (the SDK adds it)."""
+    url = (base_url or "").strip().rstrip("/")
+    if url.endswith("/v1"):
+        url = url[: -len("/v1")]
+    return url
+
+
+def resolve_client_settings(config: dict[str, Any]) -> tuple[str, str]:
+    """Return (api_key, base_url) for building an AsyncAnthropic client.
+
+    With a custom base URL (e.g. a local Ollama server), an API key is optional:
+    Ollama ignores it, so a placeholder is used when none is configured. Without a
+    base URL, the key is returned as-is and "" means "not configured".
+    """
+    base_url = normalize_base_url(config.get(CONF_AI_BASE_URL))
+    api_key = config.get(CONF_AI_API_KEY, "") or ""
+    if base_url and not api_key:
+        api_key = AI_LOCAL_PLACEHOLDER_API_KEY
+    return api_key, base_url
+
+
+def build_sdk_client(api_key: str, base_url: str = "") -> Any:
+    """Construct an AsyncAnthropic client, pointed at base_url when given.
+
+    Blocking (reads local config / TLS bundle) — callers on the event loop should
+    run it via hass.async_add_executor_job.
+    """
+    if base_url:
+        return AsyncAnthropic(api_key=api_key, base_url=base_url)
+    return AsyncAnthropic(api_key=api_key)
+
+
 def detect_model_tier(model_id: str) -> str | None:
     """Return the capability tier ("opus"/"sonnet"/"haiku") a model ID belongs to.
 
@@ -156,7 +191,7 @@ def detect_model_tier(model_id: str) -> str | None:
     return None
 
 
-async def fetch_available_models(api_key: str, hass: Any | None = None) -> list[str]:
+async def fetch_available_models(api_key: str, hass: Any | None = None, base_url: str = "") -> list[str]:
     """Fetch the live list of available Claude model IDs from Anthropic.
 
     This function must never raise — on any failure (no API key, network error,
@@ -173,19 +208,26 @@ async def fetch_available_models(api_key: str, hass: Any | None = None) -> list[
             and defaults to None so existing callers/tests without a hass
             reference are unaffected.
     """
+    base_url = normalize_base_url(base_url)
+    if base_url and not api_key:
+        api_key = AI_LOCAL_PLACEHOLDER_API_KEY
     if not api_key or not ANTHROPIC_AVAILABLE:
         return list(AI_MODELS)
     try:
         if hass is not None:
-            client = await hass.async_add_executor_job(functools.partial(AsyncAnthropic, api_key=api_key))
+            client = await hass.async_add_executor_job(functools.partial(build_sdk_client, api_key, base_url))
         else:
-            client = AsyncAnthropic(api_key=api_key)
+            client = build_sdk_client(api_key, base_url)
         page = await client.models.list()
         models = [m.id for m in page.data]
+        if base_url:
+            # Custom endpoint: its own model names are the only valid choices.
+            return models
         return models if models else list(AI_MODELS)
     except Exception:
         _LOGGER.debug("fetch_available_models: live fetch failed, using static fallback list", exc_info=True)
-        return list(AI_MODELS)
+        # Claude model names are meaningless to a custom endpoint like Ollama.
+        return [] if base_url else list(AI_MODELS)
 
 
 class ClaudeAPIClient:
@@ -211,10 +253,13 @@ class ClaudeAPIClient:
         self._client: Any = client
 
         if self._client is None and ANTHROPIC_AVAILABLE:
-            api_key = config.get(CONF_AI_API_KEY, "")
+            api_key, base_url = resolve_client_settings(config)
             if api_key:
-                self._client = AsyncAnthropic(api_key=api_key)
-                _LOGGER.debug("API client initialized — key configured")
+                self._client = build_sdk_client(api_key, base_url)
+                if base_url:
+                    _LOGGER.debug("API client initialized — custom endpoint %s", base_url)
+                else:
+                    _LOGGER.debug("API client initialized — key configured")
             else:
                 _LOGGER.warning("No AI API key configured; Claude API client will not be active")
 
@@ -243,8 +288,8 @@ class ClaudeAPIClient:
         now = time.monotonic()
         if self._models_cache is not None and (now - self._models_cache_ts) < _MODEL_LIST_CACHE_TTL_SECONDS:
             return self._models_cache
-        api_key = self._config.get(CONF_AI_API_KEY, "")
-        models = await fetch_available_models(api_key)
+        api_key, base_url = resolve_client_settings(self._config)
+        models = await fetch_available_models(api_key, base_url=base_url)
         self._models_cache = models
         self._models_cache_ts = now
         return models
@@ -607,14 +652,14 @@ class ClaudeAPIClient:
         if not ANTHROPIC_AVAILABLE:
             return False, "anthropic package is not installed"
 
-        api_key = self._config.get(CONF_AI_API_KEY, "")
+        api_key, base_url = resolve_client_settings(self._config)
         if not api_key:
             return False, "No API key configured"
 
         if hass is not None:
-            test_client = await hass.async_add_executor_job(functools.partial(AsyncAnthropic, api_key=api_key))
+            test_client = await hass.async_add_executor_job(functools.partial(build_sdk_client, api_key, base_url))
         else:
-            test_client = AsyncAnthropic(api_key=api_key)
+            test_client = build_sdk_client(api_key, base_url)
         try:
             await test_client.messages.create(
                 model=self._config.get(CONF_AI_MODEL, DEFAULT_AI_MODEL),
@@ -746,15 +791,16 @@ class ClaudeAPIClient:
             config: New config entry data dict.
 
         """
-        old_key = self._config.get(CONF_AI_API_KEY, "")
-        new_key = config.get(CONF_AI_API_KEY, "")
+        old_settings = resolve_client_settings(self._config)
+        new_key, new_base_url = resolve_client_settings(config)
 
         self._config = config
 
-        if new_key != old_key:
+        if (new_key, new_base_url) != old_settings:
+            self._models_cache = None
             if new_key and ANTHROPIC_AVAILABLE:
-                self._client = AsyncAnthropic(api_key=new_key)
-                _LOGGER.debug("API client re-initialized — key updated")
+                self._client = build_sdk_client(new_key, new_base_url)
+                _LOGGER.debug("API client re-initialized — key or endpoint updated")
             else:
                 self._client = None
                 _LOGGER.warning("AI API key removed; Claude API client deactivated")
@@ -880,6 +926,10 @@ class ClaudeAPIClient:
                 rates = model_rates
                 break
 
+        if rates is None and (self._config.get(CONF_AI_BASE_URL) or "").strip():
+            # Non-Claude model on a custom endpoint (e.g. local Ollama) — free.
+            return 0.0
+
         if rates is None:
             # Default to Sonnet rates if model is unrecognised
             rates = _MODEL_COSTS["claude-sonnet"]
@@ -918,6 +968,9 @@ class ClaudeAPIClient:
         prior to claude-sonnet-5) and logs a WARNING naming it.
         """
         caps = AI_MODEL_CAPABILITIES.get(model)
+        if caps is None and (self._config.get(CONF_AI_BASE_URL) or "").strip():
+            # Custom endpoint models (llama, qwen, ...) are expected to be unlisted.
+            caps = AI_MODEL_CAPABILITIES_DEFAULT
         if caps is None:
             _LOGGER.warning(
                 "Model '%s' is not in AI_MODEL_CAPABILITIES — using the safe legacy "
